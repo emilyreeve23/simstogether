@@ -1,5 +1,5 @@
-"""Sims Together LAN v0.1: independent, text-only LAN lobby protocol.
-Not compatible with SimSync, and does not interface with The Sims 4.
+"""Sims Together v0.5: LAN lobby + file/save transfer + compatibility summaries.
+Separate from SimSync; in-game integration remains limited to the Stage 2 ping.
 """
 import json
 import base64
@@ -12,12 +12,14 @@ import socket
 import threading
 import time
 
-PORT = 51130
+PORT = 51245
 MAX_LINE = 8192
-PROTOCOL = 2
+PROTOCOL = 3
 MAX_FILE = 2 * 1024 * 1024
 CHUNK = 3072
-TRANSFER_TYPES = {"file_offer", "file_accept", "file_reject", "file_chunk", "file_done"}
+TRANSFER_TYPES = {"file_offer", "file_accept", "file_reject", "file_chunk", "file_done",
+                  "save_offer", "save_accept", "save_reject", "save_chunk", "save_done", "save_verified", "compat_report"}
+from save_tools import MAX_SAVE_BYTES, sha256_file
 
 
 def _send(sock, message):
@@ -123,6 +125,19 @@ class LobbyServer:
                     text = str(msg.get("text", "")).strip()[:500]
                     if text:
                         self._broadcast({"type": "chat", "from": name, "text": text})
+                elif msg.get("type") == "compat_report":
+                    report = msg.get('report')
+                    if not isinstance(report, dict):
+                        continue
+                    packet = {'type': 'compat_report', 'from': name, 'report': report}
+                    with self.lock:
+                        destinations = [peer for peer in self.peers if peer is not conn]
+                    for destination in destinations:
+                        try:
+                            with self.send_lock:
+                                _send(destination, packet)
+                        except (OSError, ValueError):
+                            pass
                 elif msg.get("type") in TRANSFER_TYPES:
                     target = str(msg.get("to", ""))
                     with self.lock:
@@ -192,6 +207,8 @@ class LobbyClient:
         self.thread = None
         self.transfer_waiters = {}
         self.transfer_lock = threading.Lock()
+        self.save_receivers = {}
+        self.save_lock = threading.RLock()
 
     def connect(self, host, port, code, name):
         self.stop.clear()
@@ -216,14 +233,24 @@ class LobbyClient:
                     self.events.put(("chat", (msg.get("from", "?"), msg.get("text", ""))))
                 elif kind == "file_offer":
                     self.events.put(("file_offer", msg))
+                elif kind == "save_offer":
+                    self.events.put(("save_offer", msg))
+                elif kind == "save_chunk":
+                    self._save_chunk(msg)
+                elif kind == "save_done":
+                    self._finish_save(msg)
+                elif kind == "save_verified":
+                    self.events.put(('save_verified', msg))
+                elif kind == "compat_report":
+                    self.events.put(("compat_report", msg))
                 elif kind in ("file_chunk", "file_done"):
                     self.events.put((kind, msg))
-                elif kind in ("file_accept", "file_reject"):
+                elif kind in ("file_accept", "file_reject", "save_accept", "save_reject"):
                     transfer_id = str(msg.get("id", ""))
                     with self.transfer_lock:
                         waiter = self.transfer_waiters.get(transfer_id)
                         if waiter and msg.get("from") == waiter["to"]:
-                            waiter["accepted"] = kind == "file_accept"
+                            waiter["accepted"] = kind in ("file_accept", "save_accept")
                             waiter["signal"].set()
                     self.events.put(("transfer_reply", msg))
                 elif kind in ("notice", "error"):
@@ -292,8 +319,169 @@ class LobbyClient:
     def file_decision(self, to, transfer_id, accept):
         self._write({"type": "file_accept" if accept else "file_reject", "to": to, "id": transfer_id})
 
+    def report_compat(self, report):
+        if not self.connected:
+            raise ConnectionError('Not connected')
+        self._write({'type': 'compat_report', 'report': report})
+
+    def begin_save_receive(self, msg, storage):
+        """Call from the UI thread *before* sending save_accept."""
+        import re
+        token = str(msg.get('id', ''))
+        name = str(msg.get('name', ''))
+        sender = str(msg.get('from', ''))
+        expected = str(msg.get('sha256', ''))
+        size = msg.get('size')
+        if not (re.fullmatch(r'[0-9a-f]{32}', token) and
+                re.fullmatch(r'Slot_[0-9a-fA-F]{8}\.save', name, re.I) and
+                re.fullmatch(r'[0-9a-f]{64}', expected) and
+                isinstance(size, int) and 1 <= size <= MAX_SAVE_BYTES and
+                1 <= len(sender) <= 24):
+            raise ValueError('Malformed or oversized save offer')
+        target_dir = Path(storage)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        # The received file is staged outside the game's active saves folder.
+        label = time.strftime('%Y%m%d-%H%M%S') + '_' + token[:8] + '_' + name
+        target = target_dir / label
+        partial = target_dir / (label + '.partial')
+        with self.save_lock:
+            if token in self.save_receivers:
+                raise ValueError('Duplicate transfer')
+            handle = partial.open('xb')
+            self.save_receivers[token] = {'from': sender, 'target': target, 'partial': partial,
+                                           'handle': handle, 'size': size, 'name': name,
+                                           'received': 0, 'hash': expected,
+                                           'digest': hashlib.sha256(), 'started': time.monotonic(),
+                                           'last_note': 0}
+        self._write({'type': 'save_accept', 'to': sender, 'id': token})
+
+    def decline_save(self, msg):
+        self._write({'type': 'save_reject', 'to': str(msg.get('from', '')), 'id': str(msg.get('id', ''))})
+
+    def _discard_save(self, token, reason):
+        with self.save_lock:
+            state = self.save_receivers.pop(token, None)
+            if state:
+                try:
+                    state['handle'].close()
+                finally:
+                    try:
+                        state['partial'].unlink()
+                    except OSError:
+                        pass
+        if state:
+            self.events.put(('save_status', reason))
+
+    def _save_chunk(self, msg):
+        token = str(msg.get('id', ''))
+        with self.save_lock:
+            state = self.save_receivers.get(token)
+            if not state or msg.get('from') != state['from']:
+                return
+            try:
+                data = base64.b64decode(str(msg.get('data', '')), validate=True)
+                if not 0 < len(data) <= CHUNK:
+                    raise ValueError('Invalid save chunk size')
+                if state['received'] + len(data) > state['size']:
+                    raise ValueError('Save transfer exceeded advertised size')
+                if time.monotonic() - state['started'] > 1800:
+                    raise ValueError('Save transfer timed out')
+                state['handle'].write(data)
+                state['digest'].update(data)
+                state['received'] += len(data)
+                pct = int(100 * state['received'] / state['size'])
+                if pct >= state['last_note'] + 10:
+                    state['last_note'] = pct
+                    self.events.put(('save_status', 'Receiving %s: %s%%' % (state['name'], pct)))
+            except (ValueError, OSError, base64.binascii.Error) as exc:
+                self._discard_save(token, 'Rejected save data: ' + str(exc))
+
+    def _finish_save(self, msg):
+        token = str(msg.get('id', ''))
+        with self.save_lock:
+            state = self.save_receivers.get(token)
+            if not state or msg.get('from') != state['from']:
+                return
+            state['handle'].flush()
+            state['handle'].close()
+            if state['received'] != state['size'] or state['digest'].hexdigest() != state['hash']:
+                self._discard_save(token, 'Save checksum/size did not match; discarded.')
+                return
+            try:
+                state['partial'].replace(state['target'])
+            except OSError as exc:
+                self._discard_save(token, 'Could not stage received save: ' + str(exc))
+                return
+            self.save_receivers.pop(token, None)
+            self.events.put(('save_received', {'path': str(state['target']), 'from': state['from'],
+                                               'hash': state['hash'], 'size': state['size']}))
+            try:
+                self._write({'type': 'save_verified', 'to': state['from'], 'id': token,
+                             'sha256': state['hash']})
+            except OSError:
+                pass
+
+    def transmit_save(self, path, recipient):
+        """Send ONLY an already created, stable private save snapshot."""
+        path = Path(path)
+        if not self.connected:
+            self.events.put(('save_status', 'Cannot send: not connected.'))
+            return
+        size = path.stat().st_size
+        if not (0 < size <= MAX_SAVE_BYTES):
+            self.events.put(('save_status', 'Save must be between 1 byte and 128 MB.'))
+            return
+        import re
+        # Snapshots are named <timestamp>_Slot_...save; wire filename is only the slot filename.
+        match = re.search(r'(Slot_[0-9a-fA-F]{8}\.save)\Z', path.name, re.I)
+        if not match:
+            self.events.put(('save_status', 'Not a Sims 4 slot save.'))
+            return
+        token = uuid.uuid4().hex
+        signal = threading.Event()
+        waiter = {'signal': signal, 'accepted': False, 'to': recipient}
+        with self.transfer_lock:
+            self.transfer_waiters[token] = waiter
+        try:
+            checksum = sha256_file(path)
+            self._write({'type': 'save_offer', 'to': recipient, 'id': token,
+                         'name': match.group(1), 'size': size, 'sha256': checksum})
+            self.events.put(('save_status', 'Waiting for ' + recipient + ' to accept save...'))
+            if not signal.wait(timeout=60):
+                self.events.put(('save_status', 'Save request timed out.'))
+                return
+            if not waiter['accepted']:
+                self.events.put(('save_status', 'Save was declined or connection closed.'))
+                return
+            sent = 0
+            last = 0
+            with path.open('rb') as handle:
+                while True:
+                    chunk = handle.read(CHUNK)
+                    if not chunk:
+                        break
+                    if self.stop.is_set() or not self.connected:
+                        raise ConnectionError('Disconnected during transfer')
+                    self._write({'type': 'save_chunk', 'to': recipient, 'id': token,
+                                 'data': base64.b64encode(chunk).decode('ascii')})
+                    sent += len(chunk)
+                    pct = int(100 * sent / size)
+                    if pct >= last + 10:
+                        last = pct
+                        self.events.put(('save_status', 'Sending %s: %s%%' % (match.group(1), pct)))
+            self._write({'type': 'save_done', 'to': recipient, 'id': token})
+            self.events.put(('save_status', 'Save bytes sent. Waiting for receiver to verify.'))
+        except (OSError, ConnectionError, ValueError) as exc:
+            self.events.put(('save_status', 'Save transfer failed: ' + str(exc)))
+        finally:
+            with self.transfer_lock:
+                self.transfer_waiters.pop(token, None)
+
     def close(self):
         self.stop.set()
+        with self.save_lock:
+            for token in list(self.save_receivers):
+                self._discard_save(token, 'Partial save removed on disconnect.')
         with self.transfer_lock:
             for waiter in self.transfer_waiters.values():
                 waiter["signal"].set()
